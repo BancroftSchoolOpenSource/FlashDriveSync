@@ -19,7 +19,7 @@ fi
 
 mkdir -p "$PULL_DIR"
 
-for cmd in lsblk rsync findmnt realpath; do
+for cmd in lsblk rsync findmnt realpath cmp; do
     command -v "$cmd" >/dev/null 2>&1 || {
         echo "Error: '$cmd' is required but not found." >&2
         exit 1
@@ -44,6 +44,39 @@ if [ -n "$ROOT_SRC" ]; then
         ROOT_DISK=$(basename "$ROOT_SRC")
     fi
 fi
+
+# --- Safety guard -----------------------------------------------------
+# PULL_DIR / PUSH_DIR are resolved once, up front, before any USB disk is
+# mounted. If either of them actually lives *on* one of the removable
+# disks we are about to enumerate, mounting/unmounting that disk during
+# the loop can shift what those paths point at, and drive contents can
+# end up merged back into the source/collection directories. Refuse to
+# run in that situation rather than silently mixing data.
+DISKS_PRECHECK=$(lsblk -dn -o NAME,RM,TRAN,TYPE |
+    awk '$2=="1" && $4=="disk" {print $1}')
+
+for disk in $DISKS_PRECHECK; do
+    [ -n "$ROOT_DISK" ] && [ "$disk" = "$ROOT_DISK" ] && continue
+
+    while IFS= read -r mp; do
+        [ -z "$mp" ] && continue
+        case "$PULL_DIR/" in
+            "$mp"/*|"$mp/")
+                echo "Error: PULL_DIR '$PULL_DIR' is on removable disk /dev/$disk ($mp)." >&2
+                echo "Move PULL_DIR onto non-removable storage before running this script." >&2
+                exit 1
+                ;;
+        esac
+        case "$PUSH_DIR/" in
+            "$mp"/*|"$mp/")
+                echo "Error: PUSH_DIR '$PUSH_DIR' is on removable disk /dev/$disk ($mp)." >&2
+                echo "Move PUSH_DIR onto non-removable storage before running this script." >&2
+                exit 1
+                ;;
+        esac
+    done < <(lsblk -ln -o MOUNTPOINT "/dev/$disk" 2>/dev/null)
+done
+# -----------------------------------------------------------------------
 
 mount_partition() {
     local dev="$1"
@@ -109,6 +142,13 @@ dest_unique() {
     echo "$candidate"
 }
 
+# Merge files found under src_root into pull_dir.
+#   - If a file with the same relative path already exists in pull_dir
+#     and is byte-for-byte identical, it is skipped (already collected,
+#     not copied again).
+#   - If a file with the same relative path exists but differs, it is
+#     copied alongside under a __2, __3, ... suffix so nothing is lost.
+#   - Otherwise it is copied straight across.
 merge_into_pull_dir() {
     local src_root="$1"
     local pull_dir="$2"
@@ -124,6 +164,11 @@ merge_into_pull_dir() {
         destdir=$(dirname "$dest")
 
         mkdir -p "$destdir"
+
+        if [ -e "$dest" ] && cmp -s -- "$file" "$dest"; then
+            # Identical file already present in the collection dir.
+            continue
+        fi
 
         final=$(dest_unique "$dest")
 
@@ -198,7 +243,7 @@ for disk in $DISKS; do
         merge_into_pull_dir "$mountpoint" "$PULL_DIR"
 
         echo "  Pushing missing files -> $mountpoint"
-        rsync "${RSYNC_OPTS[@]}" --ignore-existing "$PUSH_DIR"/ "$mountpoint"/
+        rsync "${RSYNC_OPTS[@]}" --ignore-existing -- "$PUSH_DIR"/ "$mountpoint"/
 
         sync
 
